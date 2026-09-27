@@ -70,7 +70,8 @@ pub struct QuotaUsage {
 pub struct QuotaStatus {
     pub actor: Address,
     pub resource: Symbol,
-    pub config: Option<QuotaConfig>,
+    pub has_config: bool,
+    pub config: QuotaConfig,
     pub usage: QuotaUsage,
     pub remaining: u32,
     pub over_limit: bool,
@@ -129,9 +130,11 @@ pub fn get_quota_status(env: &Env, actor: &Address, resource: &Symbol) -> QuotaS
             usage.total_amount = 0;
         }
     }
-    let (remaining, over_limit) = match &config {
-        None => (u32::MAX, false),
+    let (has_config, cfg_val, remaining, over_limit) = match &config {
+        None => (false, QuotaConfig::default(), u32::MAX, false),
         Some(cfg) => (
+            true,
+            cfg.clone(),
             cfg.max_ops_per_window.saturating_sub(usage.count),
             usage.count >= cfg.max_ops_per_window,
         ),
@@ -139,7 +142,8 @@ pub fn get_quota_status(env: &Env, actor: &Address, resource: &Symbol) -> QuotaS
     QuotaStatus {
         actor: actor.clone(),
         resource: resource.clone(),
-        config,
+        has_config,
+        config: cfg_val,
         usage,
         remaining,
         over_limit,
@@ -209,122 +213,138 @@ pub fn check_and_consume(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger};
+    use soroban_sdk::{contract, contractimpl, symbol_short, testutils::Address as _, testutils::Ledger};
 
-    fn setup() -> (Env, Address, Symbol) {
+    #[contract]
+    struct DummyContract;
+    #[contractimpl]
+    impl DummyContract {}
+
+    fn setup() -> (Env, Address, Symbol, Address) {
         let env = Env::default();
         let actor = Address::generate(&env);
-        (env, actor, symbol_short!("aid_crt"))
+        let contract = env.register_contract(None, DummyContract);
+        (env, actor, symbol_short!("aid_crt"), contract)
     }
 
     #[test]
     fn within_limit_consumes_budget() {
-        let (env, actor, resource) = setup();
-        set_quota_config(
-            &env,
-            &resource,
-            &QuotaConfig {
-                max_ops_per_window: 2,
-                window_ledgers: 100,
-                max_storage_entries: 10,
-                max_amount_per_op: 1000,
-                allow_override: true,
-            },
-        )
-        .unwrap();
-        assert!(check_and_consume(&env, &actor, &resource, 100).is_ok());
-        assert!(check_and_consume(&env, &actor, &resource, 100).is_ok());
-        let status = get_quota_status(&env, &actor, &resource);
-        assert_eq!(status.remaining, 0);
-        assert!(!status.over_limit || status.remaining == 0);
-    }
-
-    #[test]
-    fn over_limit_is_blocked() {
-        let (env, actor, resource) = setup();
-        set_quota_config(
-            &env,
-            &resource,
-            &QuotaConfig {
-                max_ops_per_window: 1,
-                window_ledgers: 100,
-                max_storage_entries: 10,
-                max_amount_per_op: 0,
-                allow_override: true,
-            },
-        )
-        .unwrap();
-        assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
-        assert_eq!(
-            check_and_consume(&env, &actor, &resource, 0),
-            Err(Error::QuotaExceeded)
-        );
-        // Per-op amount cap also maps to QuotaExceeded (user-safe).
-        let (env2, actor2, resource2) = setup();
-        set_quota_config(
-            &env2,
-            &resource2,
-            &QuotaConfig {
-                max_ops_per_window: 10,
-                window_ledgers: 100,
-                max_storage_entries: 10,
-                max_amount_per_op: 50,
-                allow_override: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            check_and_consume(&env2, &actor2, &resource2, 51),
-            Err(Error::QuotaExceeded)
-        );
-    }
-
-    #[test]
-    fn window_reset_and_manual_reset_reopen_budget() {
-        let (env, actor, resource) = setup();
-        set_quota_config(
-            &env,
-            &resource,
-            &QuotaConfig {
-                max_ops_per_window: 1,
-                window_ledgers: 10,
-                max_storage_entries: 10,
-                max_amount_per_op: 0,
-                allow_override: true,
-            },
-        )
-        .unwrap();
-        assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
-        assert_eq!(
-            check_and_consume(&env, &actor, &resource, 0),
-            Err(Error::QuotaExceeded)
-        );
-        // Maintainer override: manual reset reopens budget.
-        reset_quota(&env, &actor, &resource);
-        assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
-
-        // Ledger-window rollover also reopens budget.
-        env.ledger().set_sequence_number(1_000);
-        assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
-    }
-
-    #[test]
-    fn unset_config_fails_open_and_rejects_bad_config() {
-        let (env, actor, resource) = setup();
-        // No config -> allowed.
-        assert!(check_and_consume(&env, &actor, &resource, 999).is_ok());
-        // Bad configs rejected at set time.
-        assert_eq!(
+        let (env, actor, resource, contract) = setup();
+        env.as_contract(&contract, || {
             set_quota_config(
                 &env,
                 &resource,
                 &QuotaConfig {
-                    max_ops_per_window: 0,
+                    max_ops_per_window: 2,
+                    window_ledgers: 100,
+                    max_storage_entries: 10,
+                    max_amount_per_op: 1000,
+                    allow_override: true,
+                },
+            )
+            .unwrap();
+            assert!(check_and_consume(&env, &actor, &resource, 100).is_ok());
+            assert!(check_and_consume(&env, &actor, &resource, 100).is_ok());
+            let status = get_quota_status(&env, &actor, &resource);
+            assert_eq!(status.remaining, 0);
+            assert!(!status.over_limit || status.remaining == 0);
+        });
+    }
+
+    #[test]
+    fn over_limit_is_blocked() {
+        let (env, actor, resource, contract) = setup();
+        env.as_contract(&contract, || {
+            set_quota_config(
+                &env,
+                &resource,
+                &QuotaConfig {
+                    max_ops_per_window: 1,
+                    window_ledgers: 100,
+                    max_storage_entries: 10,
+                    max_amount_per_op: 0,
+                    allow_override: true,
+                },
+            )
+            .unwrap();
+            assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
+            assert_eq!(
+                check_and_consume(&env, &actor, &resource, 0),
+                Err(Error::QuotaExceeded)
+            );
+        });
+        // Per-op amount cap also maps to QuotaExceeded (user-safe).
+        let (env2, actor2, resource2, contract2) = setup();
+        env2.as_contract(&contract2, || {
+            set_quota_config(
+                &env2,
+                &resource2,
+                &QuotaConfig {
+                    max_ops_per_window: 10,
+                    window_ledgers: 100,
+                    max_storage_entries: 10,
+                    max_amount_per_op: 50,
+                    allow_override: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                check_and_consume(&env2, &actor2, &resource2, 51),
+                Err(Error::QuotaExceeded)
+            );
+        });
+    }
+
+    #[test]
+    fn window_reset_and_manual_reset_reopen_budget() {
+        let (env, actor, resource, contract) = setup();
+        env.as_contract(&contract, || {
+            set_quota_config(
+                &env,
+                &resource,
+                &QuotaConfig {
+                    max_ops_per_window: 1,
                     window_ledgers: 10,
-                    ..Default::default()
-                }
-            ),
-            Err(Error::ConfigInvalid)
-        );
+                    max_storage_entries: 10,
+                    max_amount_per_op: 0,
+                    allow_override: true,
+                },
+            )
+            .unwrap();
+            assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
+            assert_eq!(
+                check_and_consume(&env, &actor, &resource, 0),
+                Err(Error::QuotaExceeded)
+            );
+            // Maintainer override: manual reset reopens budget.
+            reset_quota(&env, &actor, &resource);
+            assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
+
+            // Ledger-window rollover also reopens budget.
+            env.ledger().set_sequence_number(1_000);
+            assert!(check_and_consume(&env, &actor, &resource, 0).is_ok());
+        });
+    }
+
+    #[test]
+    fn unset_config_fails_open_and_rejects_bad_config() {
+        let (env, actor, resource, contract) = setup();
+        env.as_contract(&contract, || {
+            // No config -> allowed.
+            assert!(check_and_consume(&env, &actor, &resource, 999).is_ok());
+            // Bad configs rejected at set time.
+            assert_eq!(
+                set_quota_config(
+                    &env,
+                    &resource,
+                    &QuotaConfig {
+                        max_ops_per_window: 0,
+                        window_ledgers: 10,
+                        ..Default::default()
+                    }
+                ),
+                Err(Error::ConfigInvalid)
+            );
+        });
     }
 }

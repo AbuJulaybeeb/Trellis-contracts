@@ -47,6 +47,24 @@ let destructive = report.destructive_steps; // needs approval when > 0
 An invalid plan (bad version range, empty steps, unordered ids) returns
 `plan_valid: false` and the failing `MigrationError` code instead of panicking.
 
+## Storage Layout Validation & Invariant Pre-flight (Issue #97)
+
+To prevent breaking schema changes from deploying incompatible WASM code and corrupting persistent storage:
+
+1. **`MigrationHook` Interface**: Migration hooks must implement:
+   - `validate_storage(env: Env, target: Address) -> Result<(), Error>`
+   - `pre_upgrade(env: Env, old_version: u32, new_version: u32) -> bool`
+   - `post_upgrade(env: Env, old_version: u32, new_version: u32)`
+
+2. **Pre-flight Dry-Run in `propose_upgrade`**:
+   Before an upgrade proposal is accepted into the registry, the coordinator invokes `validate_storage(&env, target)` on the registered migration hook.
+   - Samples existing storage records to ensure contracttype deserialization succeeds.
+   - Verifies critical protocol invariants (e.g. total balances equal token reserves).
+   - If validation fails or panics upon deserialization, proposal creation is aborted with `UpgradeError::StorageIncompatible`.
+
+3. **Execution Guard in `execute_upgrade`**:
+   Before bytecode is swapped, `validate_storage` runs again to ensure state consistency has not drifted since proposal time.
+
 ## Running a migration
 
 ```rust

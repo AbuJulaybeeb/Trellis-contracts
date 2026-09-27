@@ -440,6 +440,12 @@ pub fn is_resumable(journal: &MigrationJournal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::{contract, contractimpl};
+
+    #[contract]
+    struct DummyContract;
+    #[contractimpl]
+    impl DummyContract {}
 
     fn step(env: &Env, id: u32, name: &str, records: u32, destructive: bool) -> MigrationStep {
         MigrationStep {
@@ -467,16 +473,19 @@ mod tests {
     #[test]
     fn dry_run_reports_impact_without_writing() {
         let env = Env::default();
-        let p = plan(&env);
-        let report = dry_run(&p);
-        assert!(report.plan_valid);
-        assert_eq!(report.error_code, 0);
-        assert_eq!(report.step_count, 2);
-        assert_eq!(report.affected_records, 125);
-        assert_eq!(report.destructive_steps, 1);
-        assert!(report.requires_approval);
-        // Dry run must not create a journal.
-        assert!(load_journal(&env).is_none());
+        let contract = env.register_contract(None, DummyContract);
+        env.as_contract(&contract, || {
+            let p = plan(&env);
+            let report = dry_run(&p);
+            assert!(report.plan_valid);
+            assert_eq!(report.error_code, 0);
+            assert_eq!(report.step_count, 2);
+            assert_eq!(report.affected_records, 125);
+            assert_eq!(report.destructive_steps, 1);
+            assert!(report.requires_approval);
+            // Dry run must not create a journal.
+            assert!(load_journal(&env).is_none());
+        });
     }
 
     #[test]
@@ -513,82 +522,91 @@ mod tests {
     #[test]
     fn journal_advances_in_order_and_resumes() {
         let env = Env::default();
-        let p = plan(&env);
-        let mut journal = begin_migration(&env, &p, 10).unwrap();
-        assert_eq!(journal.status, MigrationStatus::InProgress);
+        let contract = env.register_contract(None, DummyContract);
+        env.as_contract(&contract, || {
+            let p = plan(&env);
+            let mut journal = begin_migration(&env, &p, 10).unwrap();
+            assert_eq!(journal.status, MigrationStatus::InProgress);
 
-        // Wrong / out-of-order step id is rejected.
-        assert_eq!(
-            mark_step_complete(&env, &p, 2, 11),
-            Err(MigrationError::StepOutOfOrder)
-        );
-        journal = mark_step_complete(&env, &p, 1, 12).unwrap();
-        assert_eq!(resume_index(&journal), 1);
-        assert!(is_resumable(&journal));
-        // The next expected step is the one at the resume index.
-        assert_eq!(expected_step(&p, &journal).unwrap().id, 2);
+            // Wrong / out-of-order step id is rejected.
+            assert_eq!(
+                mark_step_complete(&env, &p, 2, 11),
+                Err(MigrationError::StepOutOfOrder)
+            );
+            journal = mark_step_complete(&env, &p, 1, 12).unwrap();
+            assert_eq!(resume_index(&journal), 1);
+            assert!(is_resumable(&journal));
+            // The next expected step is the one at the resume index.
+            assert_eq!(expected_step(&p, &journal).unwrap().id, 2);
 
-        journal = mark_step_complete(&env, &p, 2, 13).unwrap();
-        assert_eq!(resume_index(&journal), 2);
+            journal = mark_step_complete(&env, &p, 2, 13).unwrap();
+            assert_eq!(resume_index(&journal), 2);
 
-        let mut checks = Vec::new(&env);
-        checks.push_back(PostCheck {
-            id: symbol_short!("rows"),
-            passed: true,
+            let mut checks = Vec::new(&env);
+            checks.push_back(PostCheck {
+                id: symbol_short!("rows"),
+                passed: true,
+            });
+            let finished = finish_migration(&env, &checks, 14).unwrap();
+            assert_eq!(finished.status, MigrationStatus::Completed);
+            assert_eq!(finished.completed_steps, 2);
+            assert!(!is_resumable(&finished));
         });
-        let finished = finish_migration(&env, &checks, 14).unwrap();
-        assert_eq!(finished.status, MigrationStatus::Completed);
-        assert_eq!(finished.completed_steps, 2);
-        assert!(!is_resumable(&finished));
     }
 
     #[test]
     fn failed_post_check_marks_migration_failed() {
         let env = Env::default();
-        let p = plan(&env);
-        begin_migration(&env, &p, 1).unwrap();
-        mark_step_complete(&env, &p, 1, 2).unwrap();
-        mark_step_complete(&env, &p, 2, 3).unwrap();
+        let contract = env.register_contract(None, DummyContract);
+        env.as_contract(&contract, || {
+            let p = plan(&env);
+            begin_migration(&env, &p, 1).unwrap();
+            mark_step_complete(&env, &p, 1, 2).unwrap();
+            mark_step_complete(&env, &p, 2, 3).unwrap();
 
-        let mut checks = Vec::new(&env);
-        checks.push_back(PostCheck {
-            id: symbol_short!("rows"),
-            passed: true,
+            let mut checks = Vec::new(&env);
+            checks.push_back(PostCheck {
+                id: symbol_short!("rows"),
+                passed: true,
+            });
+            checks.push_back(PostCheck {
+                id: symbol_short!("sums"),
+                passed: false,
+            });
+            assert_eq!(
+                finish_migration(&env, &checks, 4),
+                Err(MigrationError::PostCheckFailed)
+            );
+            let journal = load_journal(&env).unwrap();
+            assert_eq!(journal.status, MigrationStatus::Failed);
+            assert_eq!(journal.last_error, MigrationError::PostCheckFailed as u32);
+            assert_eq!(journal.failed_step, Some(symbol_short!("sums")));
         });
-        checks.push_back(PostCheck {
-            id: symbol_short!("sums"),
-            passed: false,
-        });
-        assert_eq!(
-            finish_migration(&env, &checks, 4),
-            Err(MigrationError::PostCheckFailed)
-        );
-        let journal = load_journal(&env).unwrap();
-        assert_eq!(journal.status, MigrationStatus::Failed);
-        assert_eq!(journal.last_error, MigrationError::PostCheckFailed as u32);
-        assert_eq!(journal.failed_step, Some(symbol_short!("sums")));
     }
 
     #[test]
     fn cannot_start_twice_while_in_progress_and_can_clear() {
         let env = Env::default();
-        let p = plan(&env);
-        begin_migration(&env, &p, 1).unwrap();
-        assert_eq!(
-            begin_migration(&env, &p, 2),
-            Err(MigrationError::AlreadyInProgress)
-        );
+        let contract = env.register_contract(None, DummyContract);
+        env.as_contract(&contract, || {
+            let p = plan(&env);
+            begin_migration(&env, &p, 1).unwrap();
+            assert_eq!(
+                begin_migration(&env, &p, 2),
+                Err(MigrationError::AlreadyInProgress)
+            );
 
-        // Failing a step records the failure and frees the lock once cleared.
-        fail_migration(&env, &symbol_short!("remap"), 7, 3).unwrap();
-        let failed = load_journal(&env).unwrap();
-        assert_eq!(failed.status, MigrationStatus::Failed);
-        assert_eq!(failed.last_error, 7);
-        assert!(is_resumable(&failed));
+            // Failing a step records the failure and frees the lock once cleared.
+            fail_migration(&env, &symbol_short!("remap"), 7, 3).unwrap();
+            let failed = load_journal(&env).unwrap();
+            assert_eq!(failed.status, MigrationStatus::Failed);
+            assert_eq!(failed.last_error, 7);
+            assert!(is_resumable(&failed));
 
-        clear_journal(&env);
-        assert!(load_journal(&env).is_none());
-        assert!(begin_migration(&env, &p, 4).is_ok());
+            clear_journal(&env);
+            assert!(load_journal(&env).is_none());
+            assert!(begin_migration(&env, &p, 4).is_ok());
+        });
     }
 
     #[test]

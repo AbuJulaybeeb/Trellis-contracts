@@ -4,7 +4,7 @@ use soroban_sdk::contracterror;
 ///
 /// Codes from 900 to 999 are reserved for errors whose meaning is shared
 /// consistently across multiple contract modules.
-#[contracterror]
+#[contracterror(export = false)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum Error {

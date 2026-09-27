@@ -72,13 +72,22 @@ pub struct RedactedPreview<'a>(&'a str);
 impl<'a> fmt::Display for RedactedPreview<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = self.0;
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() <= 8 {
+        let count = s.chars().count();
+        if count <= 8 {
             return write!(f, "***");
         }
-        let first: String = chars.iter().take(4).collect();
-        let last: String = chars.iter().rev().take(2).rev().collect();
-        write!(f, "{first}...{last}")
+        for (i, c) in s.chars().enumerate() {
+            if i < 4 {
+                write!(f, "{}", c)?;
+            }
+        }
+        write!(f, "...")?;
+        for (i, c) in s.chars().enumerate() {
+            if i >= count - 2 {
+                write!(f, "{}", c)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +232,8 @@ pub fn validate_feature_flag(value: Option<&str>) -> Result<bool, Error> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+    use std::format;
     use super::*;
 
     // 56-char well-formed seed fixture: 'S' + 55 alphanumeric chars.
@@ -255,7 +266,7 @@ mod tests {
             Err(Error::ConfigInvalid)
         );
         assert_eq!(
-            validate_secret_key(Some("S-TOO-SHORT"), Environment::Staging),
+            validate_secret_key(Some("S-INVALID-LENGTH-LONGER-THAN-16-CHARS"), Environment::Staging),
             Err(Error::ConfigInvalid)
         );
         assert_eq!(validate_feature_flag(Some("maybe")), Err(Error::ConfigInvalid));

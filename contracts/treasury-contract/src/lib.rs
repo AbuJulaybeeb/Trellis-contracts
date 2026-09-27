@@ -6,14 +6,14 @@
 //! ## Overview
 //!
 //! The Treasury Contract is the financial heart of Trellis, managing:
-//! - **Per-category balances** (e.g., `reserve`, `rewards`) for fund segregation
+//! - **Multi-token per-category balances** (e.g., `reserve`, `rewards`) for fund segregation
 //! - **Withdrawal limits** to prevent accidental large transfers
 //! - **Role-based access control** via treasury managers and administrators
 //! - **Referral reward distribution** through integration with the referral contract
 //!
 //! ## Categories
 //!
-//! The treasury organizes funds into categories, each with its own balance:
+//! The treasury organizes funds into categories per asset, each with its own balance:
 //! - **`reserve`**: Protocol emergency funds
 //! - **`rewards`**: Referral commission pool
 //! - Custom categories as defined by administrators
@@ -23,22 +23,11 @@
 //! - **Admin**: Full governance (set managers, configure limits, emergency withdraw)
 //! - **Treasury Manager**: Operational access (deposit, withdraw, distribute rewards)
 //!
-//! ## Example Flow
-//!
-//! 1. Admin calls [`TreasuryContract::initialize`] to set up the contract
-//! 2. Admin calls [`TreasuryContract::add_treasury_manager`] to grant permissions
-//! 3. Managers call [`TreasuryContract::deposit`] to fund categories
-//! 4. Managers call [`TreasuryContract::withdraw`] for routine payouts
-//! 5. Referral contract calls [`TreasuryContract::distribute_reward`] to pay commissions
-//! 6. Admin can call [`TreasuryContract::emergency_withdraw`] if contract is paused
-//!
 //! ## Queries
 //!
-//! - [`TreasuryContract::category_balance`]: Check a category's current balance
+//! - [`TreasuryContract::category_balance`]: Check an asset category's current balance
 //! - [`TreasuryContract::withdrawal_limit`]: View the max per-transaction limit
 //! - [`TreasuryContract::referral_contract`]: See the registered referral contract
-//!
-//! For full API details, see the module items below.
 
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, Symbol};
 
@@ -50,8 +39,8 @@ use shared::events::{
 };
 use shared::storage::{instance_get, instance_set, persistent_set};
 
-/// Storage key prefix for per-category balances; the full key is
-/// `(BALANCE, category)`.
+/// Storage key prefix for per-category multi-token balances; the full key is
+/// `(BALANCE, token, category)`.
 const BALANCE: Symbol = symbol_short!("cat_bal");
 /// Storage key for the configurable max per-transaction withdrawal limit.
 const MAX_WD: Symbol = symbol_short!("max_wd");
@@ -139,18 +128,24 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Credits `amount` into `category`'s balance. `TreasuryManager` only.
-    pub fn deposit(env: Env, caller: Address, category: Symbol, amount: i128) -> Result<(), Error> {
+    /// Credits `amount` into `category`'s balance for `token`. `TreasuryManager` only.
+    pub fn deposit(
+        env: Env,
+        caller: Address,
+        token: Address,
+        category: Symbol,
+        amount: i128,
+    ) -> Result<(), Error> {
         // Cheap validation first — avoids auth commit on trivial rejects.
         if amount <= 0 {
             return Err(Error::InvalidArgument);
         }
         auth::require_role(&env, &caller, Role::TreasuryManager)?;
-        let key = (BALANCE, category.clone());
+        let key = (BALANCE, token.clone(), category.clone());
         let balance: i128 = env.storage().instance().get(&key).unwrap_or(0);
         let new_balance = balance.checked_add(amount).ok_or(Error::Overflow)?;
         env.storage().instance().set(&key, &new_balance);
-        emit_treasury_deposit(&env, category, &caller, amount, new_balance);
+        emit_treasury_deposit(&env, category, &caller, &token, amount, new_balance);
         emit_action_executed(
             &env,
             symbol_short!("treasury"),
@@ -162,9 +157,9 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Returns the current balance for `category` (0 if never funded).
-    pub fn category_balance(env: Env, category: Symbol) -> i128 {
-        instance_get::<_, i128>(&env, &(BALANCE, category)).unwrap_or(0)
+    /// Returns the current balance for `token` in `category` (0 if never funded).
+    pub fn category_balance(env: Env, token: Address, category: Symbol) -> i128 {
+        instance_get::<_, i128>(&env, &(BALANCE, token, category)).unwrap_or(0)
     }
 
     /// Returns the currently configured max per-transaction withdrawal limit.
@@ -172,26 +167,25 @@ impl TreasuryContract {
         instance_get::<_, i128>(&env, &MAX_WD).unwrap_or(0)
     }
 
-    /// Withdraws `amount` from `category` to `to`.
+    /// Withdraws `amount` of `token` from `category` to `to`.
     ///
     /// Guards, in order:
-    /// 1. `caller` must hold `TreasuryManager`          → `Error::Unauthorized`
-    /// 2. `amount` must be > 0                           → `Error::InvalidArgument`
-    /// 3. `amount` must not exceed the withdrawal limit  → `Error::WithdrawalLimitExceeded`
-    /// 4. `amount` must not exceed the category balance  → `Error::InsufficientBalance`
+    /// 1. `amount` must be > 0                           → `Error::InvalidArgument`
+    /// 2. `amount` must not exceed the withdrawal limit  → `Error::WithdrawalLimitExceeded`
+    /// 3. `amount` must not exceed the category balance  → `Error::InsufficientBalance`
+    /// 4. `caller` must hold `TreasuryManager`          → `Error::Unauthorized`
     ///
     /// On success, decrements the category balance and emits the shared
-    /// `TreasuryWithdrawal` event with `(category, to, amount, remaining)`.
+    /// `TreasuryWithdrawal` event with `(category, to, token, amount, remaining)`.
     pub fn withdraw(
         env: Env,
         caller: Address,
+        token: Address,
         to: Address,
         amount: i128,
         category: Symbol,
     ) -> Result<(), Error> {
-        // **Gas optimization**: cheap validation checks first (amount > 0 is
-        // a single integer comparison) before the expensive auth commit.
-        // Failed auth is the most costly error path to reach — delay it.
+        // Gas optimization: cheap validation checks first
         if amount <= 0 {
             return Err(Error::InvalidArgument);
         }
@@ -201,22 +195,22 @@ impl TreasuryContract {
             return Err(Error::WithdrawalLimitExceeded);
         }
 
-        let key = (BALANCE, category.clone());
+        let key = (BALANCE, token.clone(), category.clone());
         let balance: i128 = instance_get(&env, &key).unwrap_or(0);
         if amount > balance {
             return Err(Error::InsufficientBalance);
         }
 
-        // Auth check last — all cheap validations have passed.
+        // Auth check last
         auth::require_role(&env, &caller, Role::TreasuryManager)?;
 
-        // Quota enforcement (Issue #65): fail-open when unconfigured.
+        // Quota enforcement: fail-open when unconfigured.
         shared::quota::check_and_consume(&env, &caller, &symbol_short!("wdraw"), amount)?;
 
         let remaining = balance - amount;
         instance_set(&env, &key, &remaining);
 
-        emit_treasury_withdrawal(&env, category, &to, amount, remaining);
+        emit_treasury_withdrawal(&env, category, &to, &token, amount, remaining);
         emit_action_executed(
             &env,
             symbol_short!("treasury"),
@@ -229,23 +223,18 @@ impl TreasuryContract {
         Ok(())
     }
 
-    /// Emergency reserve withdrawal.
+    /// Emergency reserve withdrawal for `token`.
     ///
     /// Only callable by the admin, and only while the contract is paused.
     /// Intended to move reserve funds to safety when something has gone wrong.
-    ///
-    /// # Errors
-    /// - `Error::NotPaused`            — contract is currently active.
-    /// - `Error::Unauthorized`         — caller is not the admin.
-    /// - `Error::InvalidArgument`      — `amount` is not strictly positive.
-    /// - `Error::InsufficientBalance`  — reserve balance is insufficient.
     pub fn emergency_withdraw(
         env: Env,
         caller: Address,
+        token: Address,
         to: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        // **Gas optimization**: cheapest validations first.
+        // Gas optimization: cheapest validations first.
         if amount <= 0 {
             return Err(Error::InvalidArgument);
         }
@@ -253,7 +242,7 @@ impl TreasuryContract {
             return Err(Error::NotPaused);
         }
 
-        let key = (BALANCE, RESERVE_CATEGORY);
+        let key = (BALANCE, token.clone(), RESERVE_CATEGORY);
         let balance: i128 = instance_get(&env, &key).unwrap_or(0);
         let new_balance = balance
             .checked_sub(amount)
@@ -262,14 +251,14 @@ impl TreasuryContract {
             return Err(Error::InsufficientBalance);
         }
 
-        // Auth check last — all cheap validations have passed.
+        // Auth check last
         auth::require_admin(&env, &caller)?;
         instance_set(&env, &key, &new_balance);
 
         events::emit(
             &env,
             events::TREASURY_EMERGENCY_WITHDRAW,
-            (caller.clone(), to, amount),
+            (caller.clone(), token, to, amount),
         );
         emit_action_executed(
             &env,
@@ -307,35 +296,28 @@ impl TreasuryContract {
         instance_get(&env, &REFERRAL_CONTRACT)
     }
 
-    /// Pays a referral commission of `amount` to `recipient` from the
+    /// Pays a referral commission of `amount` in `token` to `recipient` from the
     /// `Rewards` category.
     ///
-    /// Callable only by the registered referral contract. There is no
-    /// explicit `caller` argument: authorisation relies on Soroban's
-    /// invoker-contract mechanism, under which an address that is itself a
-    /// contract is automatically authorised for calls it makes directly —
-    /// so this succeeds only when the registered referral contract is the
-    /// direct caller.
-    ///
-    /// # Errors
-    /// - `Error::Unauthorized`        — no referral contract is registered,
-    ///   or the direct caller is not it.
-    /// - `Error::InvalidArgument`     — `amount` is not strictly positive.
-    /// - `Error::InsufficientBalance` — the Rewards balance can't cover
-    ///   `amount`.
-    pub fn distribute_reward(env: Env, recipient: Address, amount: i128) -> Result<(), Error> {
-        // **Gas optimization**: cheap validation before auth commit.
+    /// Callable only by the registered referral contract.
+    pub fn distribute_reward(
+        env: Env,
+        token: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        // Cheap validation before auth commit.
         if amount <= 0 {
             return Err(Error::InvalidArgument);
         }
 
-        let key = (BALANCE, REWARDS_CATEGORY);
+        let key = (BALANCE, token.clone(), REWARDS_CATEGORY);
         let balance: i128 = instance_get(&env, &key).unwrap_or(0);
         if amount > balance {
             return Err(Error::InsufficientBalance);
         }
 
-        // Auth check after all cheap validations pass.
+        // Auth check after cheap validations pass.
         let referral_contract: Address =
             instance_get(&env, &REFERRAL_CONTRACT).ok_or(Error::Unauthorized)?;
         referral_contract.require_auth();
@@ -343,7 +325,7 @@ impl TreasuryContract {
         let remaining = balance - amount;
         instance_set(&env, &key, &remaining);
 
-        emit_commission_paid(&env, &recipient, amount, env.ledger().timestamp());
+        emit_commission_paid(&env, &recipient, &token, amount, env.ledger().timestamp());
         emit_action_executed(
             &env,
             symbol_short!("treasury"),

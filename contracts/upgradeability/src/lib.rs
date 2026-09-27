@@ -393,6 +393,11 @@ impl UpgradeabilityContract {
             return Err(UpgradeError::AlreadyPending);
         }
 
+        // Dry-run validate storage layout and protocol invariants if migration hook is set
+        if let Some(ref hook_addr) = entry.migration_hook {
+            execute_validate_storage_hook(&env, hook_addr, &contract_id)?;
+        }
+
         // Create proposal.
         let proposal_id: u64 = instance_get(&env, &KEY_PROP_CNT).unwrap_or(0) + 1;
         instance_set(&env, &KEY_PROP_CNT, &proposal_id);
@@ -450,8 +455,9 @@ impl UpgradeabilityContract {
             instance_get(&env, &(KEY_REG_ENTRY, proposal.contract_id.clone()))
                 .ok_or(UpgradeError::ContractNotRegistered)?;
 
-        // Execute pre-upgrade migration hook if present.
+        // Execute storage validation and pre-upgrade migration hook if present.
         if let Some(ref hook_addr) = entry.migration_hook {
+            execute_validate_storage_hook(&env, hook_addr, &entry.contract_id)?;
             execute_pre_upgrade_hook(
                 &env,
                 hook_addr,
@@ -683,6 +689,42 @@ fn require_upgrader_role(env: &Env, caller: &Address) -> ContractResult<()> {
         Error::Unauthorized => UpgradeError::NotUpgrader,
         _ => UpgradeError::NotUpgrader,
     })
+}
+
+/// Standard MigrationHook interface required for migration hook contracts.
+pub trait MigrationHook {
+    /// Validates storage layout compatibility and protocol invariants
+    /// (e.g. total balances equal token reserves) in dry-run mode before an upgrade is applied.
+    fn validate_storage(env: Env, target: Address) -> Result<(), Error>;
+
+    /// Pre-upgrade logic executed before WASM bytecode replacement.
+    fn pre_upgrade(env: Env, old_version: u32, new_version: u32) -> bool;
+
+    /// Post-upgrade logic executed after WASM bytecode replacement.
+    fn post_upgrade(env: Env, old_version: u32, new_version: u32);
+}
+
+/// Execute the storage validation dry-run hook.
+///
+/// Calls `validate_storage(target)` on the migration hook contract.
+/// Verifies storage layout compatibility and critical protocol invariants.
+fn execute_validate_storage_hook(
+    env: &Env,
+    hook_addr: &Address,
+    target: &Address,
+) -> Result<(), UpgradeError> {
+    let args: soroban_sdk::Vec<Val> =
+        soroban_sdk::Vec::from_array(env, [target.to_val()]);
+    let result = env.try_invoke_contract::<(), Error>(
+        hook_addr,
+        &Symbol::new(env, "validate_storage"),
+        args,
+    );
+
+    match result {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(UpgradeError::StorageIncompatible),
+    }
 }
 
 /// Execute the pre-upgrade migration hook.
@@ -1562,5 +1604,70 @@ mod tests {
         assert_eq!(client.get_version(&aid), 1);
         assert_eq!(client.get_version(&treasury), 1);
         assert_eq!(client.get_version(&referral), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // State migration dry-run and storage layout validation (Issue #97)
+    // -----------------------------------------------------------------------
+
+    #[contract]
+    pub struct MockValidationHook;
+
+    #[contractimpl]
+    impl MockValidationHook {
+        pub fn init(env: Env, compatible: bool) {
+            env.storage().instance().set(&symbol_short!("compat"), &compatible);
+        }
+
+        pub fn validate_storage(env: Env, _target: Address) -> Result<(), Error> {
+            let compatible: bool = env.storage().instance().get(&symbol_short!("compat")).unwrap_or(true);
+            if compatible {
+                Ok(())
+            } else {
+                Err(Error::InvalidArgument)
+            }
+        }
+
+        pub fn pre_upg(_env: Env, _old_v: u32, _new_v: u32) -> bool {
+            true
+        }
+
+        pub fn pst_upg(_env: Env, _old_v: u32, _new_v: u32) {}
+    }
+
+    #[test]
+    fn test_propose_upgrade_validates_storage_success() {
+        let (env, contract_id, admin) = setup();
+        let client = client_for(&env, &contract_id);
+        let target_contract = Address::generate(&env);
+
+        let hook_addr = env.register_contract(None, MockValidationHook);
+        let hook_client = MockValidationHookClient::new(&env, &hook_addr);
+        hook_client.init(&true);
+
+        client.register_contract(&admin, &target_contract, &symbol_short!("treasury"), &1, &fake_hash(&env, 1));
+        client.set_migration_hook(&admin, &target_contract, &hook_addr);
+
+        let note = soroban_sdk::String::from_str(&env, "valid layout upgrade");
+        let pid = client.propose_upgrade(&admin, &target_contract, &fake_hash(&env, 2), &2, &note);
+        assert_eq!(pid, 1);
+    }
+
+    #[test]
+    fn test_propose_upgrade_rejects_incompatible_storage() {
+        let (env, contract_id, admin) = setup();
+        let client = client_for(&env, &contract_id);
+        let target_contract = Address::generate(&env);
+
+        let hook_addr = env.register_contract(None, MockValidationHook);
+        let hook_client = MockValidationHookClient::new(&env, &hook_addr);
+        hook_client.init(&false);
+
+        client.register_contract(&admin, &target_contract, &symbol_short!("treasury"), &1, &fake_hash(&env, 1));
+        client.set_migration_hook(&admin, &target_contract, &hook_addr);
+
+        let note = soroban_sdk::String::from_str(&env, "breaking layout change");
+        let result = client.try_propose_upgrade(&admin, &target_contract, &fake_hash(&env, 2), &2, &note);
+        assert_eq!(result, Err(Ok(UpgradeError::StorageIncompatible)));
     }
 }
