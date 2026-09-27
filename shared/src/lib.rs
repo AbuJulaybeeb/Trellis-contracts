@@ -11,6 +11,7 @@ pub mod math;
 pub mod migration;
 pub mod payments;
 pub mod quota;
+pub mod retention;
 pub mod storage;
 pub mod utils;
 
@@ -42,6 +43,13 @@ pub use config::{
 pub use quota::{
     check_and_consume, get_quota_config, get_quota_status, get_usage, reset_quota,
     set_quota_config, QuotaConfig, QuotaStatus, QuotaUsage,
+};
+pub use retention::{
+    active_hold, apply_cleanup, class_label, classify, days_to_ledgers, default_policy,
+    get_effective_policy, get_hold, get_record, get_retention_policy, is_frozen, plan_cleanup,
+    plan_cleanup_at, place_hold, put_record, release_hold, set_retention_policy, CleanupEntry,
+    CleanupPlan, CleanupReport, DataClass, HoldReason, RetentionHold, RetentionPolicy,
+    RetentionRecord, HOLD_INDEFINITE, LEDGERS_PER_DAY, MAX_RETAIN_LEDGERS,
 };
 pub use events::{
     emit, emit_collection_registered, emit_nft_auction, emit_nft_bid, emit_nft_listed,
