@@ -21,6 +21,8 @@ pub const REFERRAL_REGISTERED: Symbol = symbol_short!("ref_reg");
 pub const PROPOSAL_CREATED: Symbol = symbol_short!("prop_new");
 pub const PROPOSAL_APPROVED: Symbol = symbol_short!("prop_apr");
 pub const PROPOSAL_EXECUTED: Symbol = symbol_short!("prop_exc");
+pub const PROPOSAL_CANCELLED: Symbol = symbol_short!("prop_can");
+pub const PROPOSAL_EXPIRED: Symbol = symbol_short!("prop_exp");
 pub const ROLE_GRANTED: Symbol = symbol_short!("role_grt");
 pub const ROLE_REVOKED: Symbol = symbol_short!("role_rvk");
 

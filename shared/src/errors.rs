@@ -38,6 +38,10 @@ pub enum Error {
     BelowThreshold = 14,
     /// The proposal has already been executed.
     AlreadyExecuted = 15,
+    /// The governance proposal passed its execution window.
+    ProposalExpired = 26,
+    /// The governance proposal was cancelled by its proposer or super-admin.
+    ProposalCancelled = 27,
     /// Attempted to modify an entry that has been marked immutable.
     ImmutableEntry = 16,
     /// The supplied metadata hash is invalid (wrong length or format).
