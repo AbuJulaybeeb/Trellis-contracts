@@ -89,6 +89,36 @@ oracle_client.update_price(&btc_address, &450000000000, &6); // $45,000 with 6 d
 let registry_addr = create_mock_registry(&env, &admin);
 ```
 
+## Integration Sandbox Mode
+
+Run the primary workflow locally against fake external services — no
+production credentials, real wallets, or irreversible records:
+
+```rust
+use testing::sandbox::*;
+
+let mut sandbox = Sandbox::new(&env, SandboxConfig::new(1234)).unwrap();
+let asset = soroban_sdk::Symbol::new(&env, "sandbox_asset");
+
+sandbox.oracle_mut().set_price(&asset, 1_000_000).unwrap();
+sandbox.token_mut().mint(&payer, 100_000).unwrap();
+
+let report = sandbox
+    .run_primary_workflow(&env, &payer, &payee, &asset, 100_000)
+    .unwrap();
+assert_eq!(report.fee, 500); // 50 bps
+
+// Or run the whole declared scenario matrix:
+for outcome in run_all_fixtures(&env).iter() {
+    assert!(outcome.passed, "fixture expectation not met");
+}
+```
+
+Mainnet is rejected, local runs are loopback-only, key material is refused,
+and every adapter response is reproducible from `deterministic_seed`. See
+[`docs/SANDBOX.md`](../docs/SANDBOX.md) for guardrails, fixtures, and
+limitations.
+
 ## Simulation & Gas Profiling
 
 Run deterministic simulations of complex scenarios:
@@ -161,3 +191,5 @@ The example tests in this module run automatically in CI. Add your contract's te
 3. Add fuzzing tests for all critical functions in your contract
 4. Profile gas usage of your contract's operations using the GasProfiler
 5. Use the mock contracts to isolate your contract's logic during testing
+6. Use sandbox mode when a test needs an oracle, token, or RPC round-trip:
+   the fakes are deterministic, so failures are reproducible
