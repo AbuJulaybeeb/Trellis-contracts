@@ -13,6 +13,7 @@ pub mod payments;
 pub mod quota;
 pub mod retention;
 pub mod storage;
+pub mod timeline;
 pub mod utils;
 
 // Re-export the most commonly-needed items at crate root for ergonomic use.
@@ -73,6 +74,14 @@ pub use storage::{
 };
 pub use utils::{is_expired, now};
 
+pub use timeline::{
+    anonymous_viewer, append_user_event, audit_trail, can_view, delete_entry, entry_count,
+    entry_exists, entry_is_redacted, is_maintainer, next_audit_seq, next_seq, redact_entry,
+    record_audit_event, timeline_page, viewer_for, AuditEntry, ResourceLink, TimelineEntry,
+    TimelineEventType, TimelineKey, TimelinePage, Viewer, Visibility, DEFAULT_PAGE_SIZE,
+    MAX_PAGE_SIZE, MAX_SCAN_PER_PAGE,
+};
+
 pub use canonical::{
     canonical_bytes, canonical_fingerprint, canonicalize_legacy, ensure_supported_encoding,
     is_legacy_encoding, normalize_int, normalize_text, parse_legacy_kv, CanonicalPart,
@@ -82,3 +91,5 @@ pub use canonical::{
 mod test_auth;
 #[cfg(test)]
 mod test_storage;
+#[cfg(test)]
+mod test_timeline;
