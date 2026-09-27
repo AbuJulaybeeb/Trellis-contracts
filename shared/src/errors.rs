@@ -130,4 +130,10 @@ pub enum Error {
     InvalidRoyaltyRate = 1007,
     /// The auto-extension window is invalid.
     InvalidExtensionWindow = 1008,
+    /// Illegal state transition.
+    InvalidTransition = 950,
+    /// Aid not yet expired.
+    AidNotExpiredYet = 951,
+    /// Aid already refunded.
+    AidAlreadyRefunded = 952,
 }

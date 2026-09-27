@@ -7,6 +7,7 @@ pub mod compat;
 pub mod config;
 pub mod errors;
 pub mod events;
+pub mod lifecycle;
 pub mod math;
 pub mod migration;
 pub mod payments;
