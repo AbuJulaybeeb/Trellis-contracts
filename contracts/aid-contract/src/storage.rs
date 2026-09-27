@@ -46,7 +46,15 @@ pub enum DataKey {
     /// Append-only list of aid IDs created by a donor (persistent).
     DonorAids(Address),
     /// Append-only list of aid IDs assigned to a recipient (persistent).
-    RecipientAids(Address),
+    RecipientIndex(Address),
+    /// IDs currently eligible for discovery search. Canonical records remain
+    /// the source of truth; this is a repairable derived index.
+    SearchIndex,
+    /// An additional address permitted to discover a particular aid record.
+    SearchAccess(u64, Address),
+    /// Admin-controlled discovery visibility flag. Missing means visible for
+    /// backwards-compatible records.
+    SearchHidden(u64),
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +169,38 @@ pub fn get_recipient_index(env: &Env, recipient: &Address) -> Vec<u64> {
 
 pub fn append_recipient_index(env: &Env, recipient: &Address, aid_id: u64) {
     append_recipient_aid(env, recipient, aid_id);
+}
+
+// ---------------------------------------------------------------------------
+// Permission-aware discovery index
+// ---------------------------------------------------------------------------
+
+pub fn get_search_index(env: &Env) -> Vec<u64> {
+    persistent_get(env, &DataKey::SearchIndex).unwrap_or_else(|| Vec::new(env))
+}
+
+pub fn set_search_index(env: &Env, ids: &Vec<u64>) {
+    persistent_set(env, &DataKey::SearchIndex, ids);
+}
+
+pub fn is_search_hidden(env: &Env, aid_id: u64) -> bool {
+    persistent_get(env, &DataKey::SearchHidden(aid_id)).unwrap_or(false)
+}
+
+pub fn set_search_hidden(env: &Env, aid_id: u64, hidden: bool) {
+    persistent_set(env, &DataKey::SearchHidden(aid_id), &hidden);
+}
+
+pub fn has_search_access(env: &Env, aid_id: u64, viewer: &Address) -> bool {
+    persistent_get(env, &DataKey::SearchAccess(aid_id, viewer.clone())).unwrap_or(false)
+}
+
+pub fn set_search_access(env: &Env, aid_id: u64, viewer: &Address, granted: bool) {
+    persistent_set(
+        env,
+        &DataKey::SearchAccess(aid_id, viewer.clone()),
+        &granted,
+    );
 }
 
 // ---------------------------------------------------------------------------

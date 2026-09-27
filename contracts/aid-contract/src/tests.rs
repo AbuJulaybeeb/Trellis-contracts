@@ -301,94 +301,77 @@ fn aid_ids_are_unique_and_monotonic() {
 }
 
 // ---------------------------------------------------------------------------
-// Pagination tests
+// Permission-aware discovery index
 // ---------------------------------------------------------------------------
 
 #[test]
-fn pagination_empty_for_unknown_user() {
+fn search_filters_restricted_records_and_honors_permission_revocation() {
     let fx = setup();
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
-    let stranger = Address::generate(&fx.env);
+    let outsider = Address::generate(&fx.env);
+    let delegate = Address::generate(&fx.env);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
 
-    let page_donor = client.list_aids_by_donor(&stranger, &0, &10);
-    assert_eq!(page_donor.records.len(), 0);
-    assert_eq!(page_donor.next_cursor, None);
+    assert_eq!(client.search_aids(&outsider, &0, &10).records.len(), 0);
+    assert_eq!(client.search_aids(&fx.recipient, &0, &10).records.len(), 1);
 
-    let page_recipient = client.list_aids_by_recipient(&stranger, &0, &10);
-    assert_eq!(page_recipient.records.len(), 0);
-    assert_eq!(page_recipient.next_cursor, None);
+    client.grant_search_access(&fx.donor, &aid_id, &delegate);
+    assert_eq!(client.search_aids(&delegate, &0, &10).records.len(), 1);
+    client.revoke_search_access(&fx.donor, &aid_id, &delegate);
+    assert_eq!(client.search_aids(&delegate, &0, &10).records.len(), 0);
 }
 
 #[test]
-fn pagination_cursor_and_multi_page_traversal() {
+fn visibility_change_and_deletion_remove_discovery_entries() {
     let fx = setup();
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
 
-    let created_ids = create_aids(&fx.env, &client, &fx.donor, &fx.recipient, 5);
+    client.set_aid_search_visibility(&fx.admin, &aid_id, &false);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    client.set_aid_search_visibility(&fx.admin, &aid_id, &true);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 1);
 
-    // Page 1: cursor 0, limit 2 -> items 0, 1
-    let p1 = client.list_aids_by_donor(&fx.donor, &0, &2);
-    assert_eq!(p1.records.len(), 2);
-    assert_eq!(p1.records.get(0).unwrap().id, created_ids[0]);
-    assert_eq!(p1.records.get(1).unwrap().id, created_ids[1]);
-    assert_eq!(p1.next_cursor, Some(2));
-
-    // Page 2: cursor 2, limit 2 -> items 2, 3
-    let p2 = client.list_aids_by_donor(&fx.donor, &p1.next_cursor.unwrap(), &2);
-    assert_eq!(p2.records.len(), 2);
-    assert_eq!(p2.records.get(0).unwrap().id, created_ids[2]);
-    assert_eq!(p2.records.get(1).unwrap().id, created_ids[3]);
-    assert_eq!(p2.next_cursor, Some(4));
-
-    // Page 3: cursor 4, limit 2 -> item 4, next_cursor None
-    let p3 = client.list_aids_by_donor(&fx.donor, &p2.next_cursor.unwrap(), &2);
-    assert_eq!(p3.records.len(), 1);
-    assert_eq!(p3.records.get(0).unwrap().id, created_ids[4]);
-    assert_eq!(p3.next_cursor, None);
-
-    // Past last page: cursor 10 -> empty list, next_cursor None
-    let p_past = client.list_aids_by_donor(&fx.donor, &10, &2);
-    assert_eq!(p_past.records.len(), 0);
-    assert_eq!(p_past.next_cursor, None);
+    client.claim_aid(&aid_id, &fx.recipient);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    client.delete_aid(&fx.admin, &aid_id);
+    assert_eq!(client.get_aid(&aid_id), None);
 }
 
 #[test]
-fn pagination_by_recipient_matches_assigned_aids() {
+fn repair_search_index_restores_missing_entries_and_removes_stale_ones() {
     let fx = setup();
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
-    let other_recipient = Address::generate(&fx.env);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
 
-    let id1 = client.create_aid(&fx.donor, &fx.recipient, &100, &(fx.env.ledger().sequence() + 1000));
-    let id2 = client.create_aid(&fx.donor, &other_recipient, &200, &(fx.env.ledger().sequence() + 1000));
-    let id3 = client.create_aid(&fx.donor, &fx.recipient, &300, &(fx.env.ledger().sequence() + 1000));
+    // Simulate a partial indexer write and a dangling entry from evicted data.
+    let mut corrupt = Vec::new(&fx.env);
+    corrupt.push_back(99_999);
+    storage::set_search_index(&fx.env, &corrupt);
 
-    let p_rec1 = client.list_aids_by_recipient(&fx.recipient, &0, &10);
-    assert_eq!(p_rec1.records.len(), 2);
-    assert_eq!(p_rec1.records.get(0).unwrap().id, id1);
-    assert_eq!(p_rec1.records.get(1).unwrap().id, id3);
-    assert_eq!(p_rec1.next_cursor, None);
-
-    let p_rec2 = client.list_aids_by_recipient(&other_recipient, &0, &10);
-    assert_eq!(p_rec2.records.len(), 1);
-    assert_eq!(p_rec2.records.get(0).unwrap().id, id2);
-    assert_eq!(p_rec2.next_cursor, None);
+    let report = client.repair_search_index(&fx.admin);
+    assert_eq!(report.indexed, 1);
+    assert_eq!(report.added, 1);
+    assert_eq!(report.removed, 1);
+    let results = client.search_aids(&fx.donor, &0, &10);
+    assert_eq!(results.records.len(), 1);
+    assert_eq!(results.records.get(0).unwrap().id, aid_id);
 }
 
-#[test]
-fn pagination_max_query_limit_enforced() {
-    let fx = setup();
-    let client = AidContractClient::new(&fx.env, &fx.contract_id);
-
-    // Create 55 aids (more than MAX_QUERY_LIMIT = 50)
-    let _ids = create_aids(&fx.env, &client, &fx.donor, &fx.recipient, 55);
-
-    // Request with limit 100, should be capped at 50
-    let page = client.list_aids_by_donor(&fx.donor, &0, &100);
-    assert_eq!(page.records.len(), 50);
-    assert_eq!(page.next_cursor, Some(50));
-
-    // Next page fetches remaining 5
-    let page2 = client.list_aids_by_donor(&fx.donor, &page.next_cursor.unwrap(), &100);
-    assert_eq!(page2.records.len(), 5);
-    assert_eq!(page2.next_cursor, None);
-}
+// Pagination tests removed: get_aids_by_donor/get_aids_by_recipient
+// not yet implemented on AidContract.

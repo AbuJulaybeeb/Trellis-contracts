@@ -33,6 +33,8 @@ const DEFAULT_REFERRAL_MAX_TIERS: i128 = 3;
 const MIN_REFERRAL_REWARD_CAP: i128 = 0;
 const MAX_REFERRAL_REWARD_CAP: i128 = 1_000_000_000_000_000_000;
 const DEFAULT_REFERRAL_REWARD_CAP: i128 = 10_000_000_000;
+/// Proposals are actionable for 30 days after creation.
+pub const PROPOSAL_LIFETIME: u64 = 30 * 24 * 60 * 60;
 
 type ContractResult<T> = core::result::Result<T, Error>;
 
@@ -105,6 +107,8 @@ pub enum ProposalAction {
 pub enum ProposalStatus {
     Pending,
     Executed,
+    Cancelled,
+    Expired,
 }
 
 /// A multi-sig proposal.
@@ -117,6 +121,7 @@ pub struct Proposal {
     pub approval_count: u32,
     pub status: ProposalStatus,
     pub created_at: u64,
+    pub expires_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +287,7 @@ impl GovernanceContract {
             approval_count: 0,
             status: ProposalStatus::Pending,
             created_at: env.ledger().timestamp(),
+            expires_at: env.ledger().timestamp().saturating_add(PROPOSAL_LIFETIME),
         };
 
         let proposal_key = (KEY_PROPOSAL, new_id);
@@ -310,6 +316,16 @@ impl GovernanceContract {
 
         if proposal.status != ProposalStatus::Pending {
             return Err(Error::AlreadyExecuted);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
         }
 
         // Check for duplicate approval.
@@ -354,6 +370,22 @@ impl GovernanceContract {
             return Err(Error::AlreadyExecuted);
         }
 
+        if proposal.status == ProposalStatus::Cancelled
+            || proposal.status == ProposalStatus::Expired
+        {
+            return Err(Error::ProposalCancelled);
+        }
+
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
+        }
+
         let threshold: u32 = instance_get(&env, &KEY_THRESHOLD).unwrap_or(0);
         if proposal.approval_count < threshold {
             return Err(Error::BelowThreshold);
@@ -372,6 +404,38 @@ impl GovernanceContract {
             env.ledger().timestamp(),
         );
 
+        Ok(())
+    }
+
+    /// Cancel a pending proposal before it is executed. The original proposer
+    /// or the configured super-admin may cancel it.
+    pub fn cancel(env: Env, caller: Address, proposal_id: u64) -> Result<(), Error> {
+        let proposal_key = (KEY_PROPOSAL, proposal_id);
+        let mut proposal: Proposal =
+            instance_get(&env, &proposal_key).ok_or(Error::ProposalNotFound)?;
+        let super_admin = shared::auth::get_admin(&env);
+        if caller != proposal.proposer && caller != super_admin {
+            return Err(Error::Unauthorized);
+        }
+        caller.require_auth();
+        if proposal.status != ProposalStatus::Pending {
+            return Err(Error::ProposalCancelled);
+        }
+        if env.ledger().timestamp() > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events().publish(
+                (shared::events::PROPOSAL_EXPIRED,),
+                (proposal_id, env.ledger().timestamp()),
+            );
+            return Err(Error::ProposalExpired);
+        }
+        proposal.status = ProposalStatus::Cancelled;
+        instance_set(&env, &proposal_key, &proposal);
+        env.events().publish(
+            (shared::events::PROPOSAL_CANCELLED,),
+            (proposal_id, caller, env.ledger().timestamp()),
+        );
         Ok(())
     }
 
@@ -753,6 +817,7 @@ mod tests {
         assert_eq!(proposal.action, ProposalAction::Pause);
         assert_eq!(proposal.approval_count, 0);
         assert_eq!(proposal.status, ProposalStatus::Pending);
+        assert_eq!(proposal.expires_at, proposal.created_at + PROPOSAL_LIFETIME);
     }
 
     #[test]
@@ -841,6 +906,41 @@ mod tests {
 
         let result = client.try_execute(&admin, &proposal_id);
         assert_eq!(result, Err(Ok(Error::AlreadyExecuted)));
+    }
+
+    #[test]
+    fn proposer_can_cancel_pending_proposal() {
+        let (_env, client, admin) = setup();
+        let proposal_id = client.propose(&admin, &ProposalAction::Pause);
+        client.cancel(&admin, &proposal_id);
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Cancelled
+        );
+        assert_eq!(
+            client.try_execute(&admin, &proposal_id),
+            Err(Ok(Error::ProposalCancelled))
+        );
+    }
+
+    #[test]
+    fn expired_proposal_cannot_be_approved_or_executed() {
+        let (env, client, admin) = setup();
+        let second_admin = client.get_admin_set().get(1).unwrap();
+        let proposal_id = client.propose(&admin, &ProposalAction::Pause);
+        env.ledger().set_timestamp(PROPOSAL_LIFETIME + 1);
+        assert_eq!(
+            client.try_approve(&admin, &proposal_id),
+            Err(Ok(Error::ProposalExpired))
+        );
+        assert_eq!(
+            client.get_proposal(&proposal_id).status,
+            ProposalStatus::Expired
+        );
+        assert_eq!(
+            client.try_execute(&second_admin, &proposal_id),
+            Err(Ok(Error::ProposalCancelled))
+        );
     }
 
     #[test]

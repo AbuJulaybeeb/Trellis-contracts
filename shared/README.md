@@ -79,6 +79,7 @@ than once.
 | `shared::compat` | Schema version metadata (`CURRENT_RECORD_SCHEMA_VERSION = 2`), `migrate_v1_to_v2` / `downgrade_v2_to_v1` transforms, `VersionedAidRecord` envelope | `docs/COMPATIBILITY.md` |
 | `shared::quota` | Per-actor `(actor, resource)` quota enforcement (`check_and_consume`), maintainer `get_quota_status` / `reset_quota` diagnostics, fail-open when unconfigured | `docs/QUOTA.md` |
 | `shared::config` | Typed env validation (`validate_full_config`, `Environment`), `UnsafeSecret` / `ConfigMissing` fail-fast errors, `RedactedSecret` previews that never print full secrets | `docs/CONFIGURATION.md` |
+| `shared::timeline` | User-facing activity timeline: `Public` / `Participant` / `Maintainer` visibility filtering, stable `ResourceLink` anchors, cursor pagination, and a maintainer-only audit store that is structurally separate from the user timeline | `docs/TIMELINE.md` |
 
 Contributor health checks live in `scripts/diagnostics.sh` (see
 `docs/DIAGNOSTICS.md`); deployment config gating lives in
