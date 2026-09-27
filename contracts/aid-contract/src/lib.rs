@@ -50,7 +50,7 @@ pub mod types;
 
 use storage::{get_aid, get_aid_counter, has_aid, set_aid, set_aid_counter};
 
-pub use types::{AidPage, AidRecord, AidStatus};
+pub use types::{AidPage, AidRecord, AidStatus, SearchIndexRepairReport};
 
 const KEY_AIDS: Symbol = symbol_short!("aids");
 #[allow(dead_code)]
@@ -73,6 +73,7 @@ pub enum AidError {
     NotExpiredYet = 105,
     /// The aid has already been refunded to the donor.
     AlreadyRefunded = 106,
+    CannotDeletePending = 107,
 }
 
 #[contract]
@@ -220,12 +221,9 @@ impl AidContract {
         // Quota enforcement (Issue #65): fail-open when unconfigured so
         // existing deployments keep working until maintainers set limits.
         // Over-limit callers get a user-safe QuotaExceeded panic.
-        if let Err(e) = shared::quota::check_and_consume(
-            &env,
-            &donor,
-            &symbol_short!("aid_crt"),
-            amount,
-        ) {
+        if let Err(e) =
+            shared::quota::check_and_consume(&env, &donor, &symbol_short!("aid_crt"), amount)
+        {
             if e == Error::QuotaExceeded {
                 panic_with_error!(&env, Error::QuotaExceeded);
             }
@@ -257,6 +255,7 @@ impl AidContract {
             status: AidStatus::Pending,
         };
         set_aid(&env, aid_id, &record);
+        index_aid(&env, aid_id);
 
         let mut aids: Map<u64, AidRecord> = env
             .storage()
@@ -329,6 +328,7 @@ impl AidContract {
 
         record.status = AidStatus::Settled;
         set_aid(&env, aid_id, &record);
+        remove_from_search_index(&env, aid_id);
 
         token::Client::new(&env, &record.token).transfer(
             &env.current_contract_address(),
@@ -378,6 +378,7 @@ impl AidContract {
 
         record.status = AidStatus::Refunded;
         set_aid(&env, aid_id, &record);
+        remove_from_search_index(&env, aid_id);
 
         token::Client::new(&env, &record.token).transfer(
             &env.current_contract_address(),
@@ -399,6 +400,147 @@ impl AidContract {
 
     pub fn get_aid(env: Env, aid_id: u64) -> Option<AidRecord> {
         storage::get_aid(&env, aid_id)
+    }
+
+    /// Search active aid records that `viewer` is authorized to discover.
+    ///
+    /// Indexable fields are the canonical record ID, donor, and recipient.
+    /// A record is discoverable only while pending and visible; its donor,
+    /// recipient, contract admin, or an explicitly granted address may see it.
+    pub fn search_aids(env: Env, viewer: Address, cursor: u32, limit: u32) -> AidPage {
+        viewer.require_auth();
+        let ids = storage::get_search_index(&env);
+        let effective_limit = if limit > MAX_QUERY_LIMIT {
+            MAX_QUERY_LIMIT
+        } else {
+            limit
+        };
+        let mut records = Vec::new(&env);
+        let mut index = cursor;
+        while index < ids.len() && records.len() < effective_limit {
+            if let Some(record) = get_aid(&env, ids.get(index).unwrap()) {
+                if can_discover(&env, &record, &viewer) {
+                    records.push_back(record);
+                }
+            }
+            index += 1;
+        }
+        AidPage {
+            records,
+            next_cursor: if index < ids.len() { Some(index) } else { None },
+        }
+    }
+
+    /// Grant an address access to discover one pending aid. Only its donor can
+    /// delegate discovery access.
+    pub fn grant_search_access(
+        env: Env,
+        donor: Address,
+        aid_id: u64,
+        viewer: Address,
+    ) -> Result<(), AidError> {
+        donor.require_auth();
+        let record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        if record.donor != donor {
+            return Err(AidError::Unauthorized);
+        }
+        storage::set_search_access(&env, aid_id, &viewer, true);
+        Ok(())
+    }
+
+    /// Revoke a previously granted discovery permission. Existing index rows
+    /// remain safe because every search result is filtered at read time.
+    pub fn revoke_search_access(
+        env: Env,
+        donor: Address,
+        aid_id: u64,
+        viewer: Address,
+    ) -> Result<(), AidError> {
+        donor.require_auth();
+        let record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        if record.donor != donor {
+            return Err(AidError::Unauthorized);
+        }
+        storage::set_search_access(&env, aid_id, &viewer, false);
+        Ok(())
+    }
+
+    /// Hide or restore an aid in discovery search. Admin-only; restoring a
+    /// pending record re-adds it to the derived index.
+    pub fn set_aid_search_visibility(
+        env: Env,
+        admin: Address,
+        aid_id: u64,
+        visible: bool,
+    ) -> Result<(), AidError> {
+        require_admin(&env, &admin)?;
+        let record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        storage::set_search_hidden(&env, aid_id, !visible);
+        if visible && record.status == AidStatus::Pending {
+            index_aid(&env, aid_id);
+        } else {
+            remove_from_search_index(&env, aid_id);
+        }
+        Ok(())
+    }
+
+    /// Delete a completed aid record and its derived discovery entry. Pending
+    /// records cannot be deleted because they still escrow funds.
+    pub fn delete_aid(env: Env, admin: Address, aid_id: u64) -> Result<(), AidError> {
+        require_admin(&env, &admin)?;
+        let record = get_aid(&env, aid_id).ok_or(AidError::NotFound)?;
+        if record.status == AidStatus::Pending {
+            return Err(AidError::CannotDeletePending);
+        }
+        storage::remove_aid(&env, aid_id);
+        remove_from_search_index(&env, aid_id);
+        let mut aids: Map<u64, AidRecord> = env
+            .storage()
+            .persistent()
+            .get(&KEY_AIDS)
+            .unwrap_or_else(|| Map::new(&env));
+        aids.remove(aid_id);
+        env.storage().persistent().set(&KEY_AIDS, &aids);
+        Ok(())
+    }
+
+    /// Rebuild the derived discovery index from canonical storage. This
+    /// repairs expired/evicted records, missing entries, and stale entries.
+    pub fn repair_search_index(
+        env: Env,
+        admin: Address,
+    ) -> Result<SearchIndexRepairReport, AidError> {
+        require_admin(&env, &admin)?;
+        let previous = storage::get_search_index(&env);
+        let mut rebuilt = Vec::new(&env);
+        let mut aid_id = 0;
+        while aid_id < get_aid_counter(&env) {
+            if let Some(record) = get_aid(&env, aid_id) {
+                if record.status == AidStatus::Pending && !storage::is_search_hidden(&env, aid_id) {
+                    rebuilt.push_back(aid_id);
+                }
+            }
+            aid_id += 1;
+        }
+        let mut added = 0;
+        let mut removed = 0;
+        for id in rebuilt.iter() {
+            if !contains_id(&previous, id) {
+                added += 1;
+            }
+        }
+        for id in previous.iter() {
+            if !contains_id(&rebuilt, id) {
+                removed += 1;
+            }
+        }
+        let indexed = rebuilt.len();
+        storage::set_search_index(&env, &rebuilt);
+        Ok(SearchIndexRepairReport {
+            indexed,
+            added,
+            removed,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -477,6 +619,54 @@ impl AidContract {
         );
         shared_set_paused(&env, paused);
     }
+}
+
+fn require_admin(env: &Env, admin: &Address) -> Result<(), AidError> {
+    if *admin != shared::auth::get_admin(env) {
+        return Err(AidError::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
+
+fn can_discover(env: &Env, record: &AidRecord, viewer: &Address) -> bool {
+    record.status == AidStatus::Pending
+        && !storage::is_search_hidden(env, record.id)
+        && (*viewer == record.donor
+            || *viewer == record.recipient
+            || *viewer == shared::auth::get_admin(env)
+            || storage::has_search_access(env, record.id, viewer))
+}
+
+fn contains_id(ids: &Vec<u64>, wanted: u64) -> bool {
+    for id in ids.iter() {
+        if id == wanted {
+            return true;
+        }
+    }
+    false
+}
+
+fn index_aid(env: &Env, aid_id: u64) {
+    if storage::is_search_hidden(env, aid_id) {
+        return;
+    }
+    let mut ids = storage::get_search_index(env);
+    if !contains_id(&ids, aid_id) {
+        ids.push_back(aid_id);
+        storage::set_search_index(env, &ids);
+    }
+}
+
+fn remove_from_search_index(env: &Env, aid_id: u64) {
+    let ids = storage::get_search_index(env);
+    let mut kept = Vec::new(env);
+    for id in ids.iter() {
+        if id != aid_id {
+            kept.push_back(id);
+        }
+    }
+    storage::set_search_index(env, &kept);
 }
 
 /// Slice `ids` into one page of resolved [`AidRecord`]s.

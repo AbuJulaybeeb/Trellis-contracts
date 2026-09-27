@@ -47,3 +47,15 @@ pub struct AidPage {
     pub records: Vec<AidRecord>,
     pub next_cursor: Option<u32>,
 }
+
+/// Outcome of rebuilding the discovery index from canonical aid storage.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchIndexRepairReport {
+    /// Number of pending, visible aid records placed in the rebuilt index.
+    pub indexed: u32,
+    /// Entries missing from the previous index.
+    pub added: u32,
+    /// Stale entries removed from the previous index.
+    pub removed: u32,
+}

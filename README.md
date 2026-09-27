@@ -790,6 +790,16 @@ list_aids_by_donor(
 
 - **Returns** — `PaginatedAidsResponse { aids: Vec<AidRecord>, next_cursor: Option<u64> }`
 
+#### Permission-aware discovery search
+
+`search_aids(viewer, cursor, limit)` returns only pending, visible records for
+which `viewer` authenticates as the donor, recipient, contract admin, or an
+address granted access by the donor. Completed, hidden, and deleted records
+are removed from the derived search index. Administrators can run
+`repair_search_index(admin)` to rebuild that index from canonical aid storage;
+the return value reports indexed, added, and removed entries. No migration is
+required: older records are included on the next repair run.
+
 ### Admin Controls
 
 #### `set_paused`

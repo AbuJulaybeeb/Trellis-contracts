@@ -301,5 +301,78 @@ fn aid_ids_are_unique_and_monotonic() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Permission-aware discovery index
+// ---------------------------------------------------------------------------
+
+#[test]
+fn search_filters_restricted_records_and_honors_permission_revocation() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let outsider = Address::generate(&fx.env);
+    let delegate = Address::generate(&fx.env);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
+
+    assert_eq!(client.search_aids(&outsider, &0, &10).records.len(), 0);
+    assert_eq!(client.search_aids(&fx.recipient, &0, &10).records.len(), 1);
+
+    client.grant_search_access(&fx.donor, &aid_id, &delegate);
+    assert_eq!(client.search_aids(&delegate, &0, &10).records.len(), 1);
+    client.revoke_search_access(&fx.donor, &aid_id, &delegate);
+    assert_eq!(client.search_aids(&delegate, &0, &10).records.len(), 0);
+}
+
+#[test]
+fn visibility_change_and_deletion_remove_discovery_entries() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
+
+    client.set_aid_search_visibility(&fx.admin, &aid_id, &false);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    client.set_aid_search_visibility(&fx.admin, &aid_id, &true);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 1);
+
+    client.claim_aid(&aid_id, &fx.recipient);
+    assert_eq!(client.search_aids(&fx.donor, &0, &10).records.len(), 0);
+    client.delete_aid(&fx.admin, &aid_id);
+    assert_eq!(client.get_aid(&aid_id), None);
+}
+
+#[test]
+fn repair_search_index_restores_missing_entries_and_removes_stale_ones() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let aid_id = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &100,
+        &(fx.env.ledger().sequence() + 100),
+    );
+
+    // Simulate a partial indexer write and a dangling entry from evicted data.
+    let mut corrupt = Vec::new(&fx.env);
+    corrupt.push_back(99_999);
+    storage::set_search_index(&fx.env, &corrupt);
+
+    let report = client.repair_search_index(&fx.admin);
+    assert_eq!(report.indexed, 1);
+    assert_eq!(report.added, 1);
+    assert_eq!(report.removed, 1);
+    let results = client.search_aids(&fx.donor, &0, &10);
+    assert_eq!(results.records.len(), 1);
+    assert_eq!(results.records.get(0).unwrap().id, aid_id);
+}
+
 // Pagination tests removed: get_aids_by_donor/get_aids_by_recipient
 // not yet implemented on AidContract.
