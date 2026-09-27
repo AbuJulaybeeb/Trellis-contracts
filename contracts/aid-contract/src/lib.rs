@@ -37,7 +37,7 @@
 use shared::events::{
     emit_action_executed, emit_aid_created, emit_module_initialized, emit_permission_changed,
 };
-use shared::storage::{is_paused, set_paused as shared_set_paused};
+use shared::storage::{is_paused, persistent_get, persistent_set, set_paused as shared_set_paused};
 use shared::{emit, Error, AID_CLAIMED, AID_CREATED, AID_REFUNDED, AID_SETTLED};
 use soroban_sdk::{
     contract, contracterror, contractimpl, panic_with_error, symbol_short, token, Address, Env,
@@ -257,13 +257,10 @@ impl AidContract {
         set_aid(&env, aid_id, &record);
         index_aid(&env, aid_id);
 
-        let mut aids: Map<u64, AidRecord> = env
-            .storage()
-            .persistent()
-            .get(&KEY_AIDS)
+        let mut aids: Map<u64, AidRecord> = persistent_get(&env, &KEY_AIDS)
             .unwrap_or_else(|| Map::new(&env));
         aids.set(aid_id, record);
-        env.storage().persistent().set(&KEY_AIDS, &aids);
+        persistent_set(&env, &KEY_AIDS, &aids);
 
         emit_aid_created(
             &env,

@@ -154,7 +154,27 @@ escalate to security.
 
 ---
 
-## 4. Emergency rollback
+## 4. Persistent storage TTL renewal
+
+Persistent records must use the helpers exported by `shared::storage`:
+
+- `persistent_set` writes the value and bumps it to `PERSISTENT_BUMP_AMOUNT`.
+- `persistent_get` reads the value and refreshes the TTL when the key exists.
+- `persistent_read` is reserved for an intermediate read that is guaranteed to
+  be written in the same transaction; it must not be used for public query
+  paths that need to keep records alive.
+- `persistent_has` is an existence check only. Follow it with `persistent_get`
+  when the record is needed.
+
+Do not call `env.storage().persistent().set`, `.get`, or `.extend_ttl` directly
+from a production contract. A new persistent key must be covered by a test
+that advances the ledger close to `PERSISTENT_TTL_THRESHOLD`, reads or writes
+the key through the helper, and verifies that the entry remains available.
+The current seven-day bump and six-day refresh threshold are defined in
+`shared/src/storage.rs`; change those constants deliberately and review the
+gas impact before deployment.
+
+## 5. Emergency rollback
 
 Use when a release causes incorrect state changes or blocks critical
 operations. Rollback is an **upgrade to the last known-good WASM**, plus the
